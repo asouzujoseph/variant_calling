@@ -1,6 +1,6 @@
 #!/usr/bin/bash
 
-set -e
+set -e  
 cd ../data/fastq/
 echo "Running FastQC ..."
 fastqc *.fastq
@@ -14,7 +14,7 @@ cd ../../results/fastqc_untrimmed_reads/
 echo "Unzipping ..."
 for filename in *.zip
 do
-        unzip $filename
+	unzip $filename
 done
 
 echo "saving summary..."
