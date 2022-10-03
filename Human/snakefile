@@ -1,0 +1,389 @@
+### Snakemake pipeline for variant calling using GATK4
+rule all:
+	input:
+		"results/variants/concordance.father.trio.filtered",
+		"results/variants/concordance.mother.trio.filtered",
+		"results/variants/concordance.son.trio.filtered"
+
+
+rule download_data:
+	output:
+		"ngs-variants-training.tar.gz"
+	shell:
+		"""
+		wget https://ngs-variants-training.s3.eu-central-1.amazonaws.com/ngs-variants-training.tar.gz -O {output}
+		tar -xvf {output}
+		"""
+	
+rule unzip_reads:
+	input:
+		r1="data/fastq/{sample}_R1.fastq.gz",
+		r2="data/fastq/{sample}_R2.fastq.gz"
+	output:
+		r1="data/fastq/{sample}_R1.fastq",
+		r2="data/fastq/{sample}_R2.fastq"
+	shell:
+		"""		
+		gunzip {input.r1}
+		gunzip {input.r2}
+		"""
+		
+rule index_ref_genome:
+	input: 
+		"data/reference/{genome}.fa"
+	output:
+		"data/reference/{genome}.bwt"
+	shell:
+		"bwa index {input}"
+		
+rule qcReads:
+	input:
+			"data/fastq/{sample}_R1.fastq",
+			"data/fastq/{sample}_R2.fastq"
+	output:
+			"data/results/fastqc_untrimmed/{sample}_fastqc.html"
+	shell:
+			"""
+			fastqc {input}
+			"""
+rule mapping:
+	input:
+		ref="data/reference/Homo_sapiens.GRCh38.dna.chromosome.20.fa",
+		r1="data/fastq/{sample}_R1.fastq",
+		r2="data/fastq/{sample}_R2.fastq"
+	output:
+		"results/sam/{sample}.aligned.sam"
+	shell:
+		"""
+		bwa mem {input.ref} {input.r1} {input.r2} > {output}
+		"""
+rule compress_sort_stats:
+	input:
+		"results/sam/{sample}.aligned.sam"
+	output:
+		bam="results/sortedBam/{sample}.aligned.sorted.bam",
+		stats="results/sortedBam/{sample}.aligned.sorted.bam_stats.txt"
+	shell:
+		"""		
+		samtools view -S -b {input} | samtools sort -o {output.bam}
+		samtools flagstat {output.bam} > {output.stats}
+		"""
+		
+rule read_groups:
+	input:
+		"results/sortedBam/{sample}.aligned.sorted.bam"
+	output:
+		"alignments/{sample}.rg.bam"
+	shell:
+		"""
+		gatk AddOrReplaceReadGroups \
+		--INPUT {input} \
+		--OUTPUT {output} \
+		--RGLB lib1 \
+		--RGPU H0164.2.ALXX140820 \
+		--RGPL ILLUMINA \
+		--RGSM {wildcards.sample} \
+		--RGID H0164.2
+		"""
+
+rule mark_duplicates:
+	input:
+		"alignments/{sample}.rg.bam"
+	output:
+		"alignments/{sample}.rg.md.bam"
+	shell:
+		"""
+		gatk MarkDuplicates \
+		--INPUT {input} \
+		--OUTPUT {output} \
+		--METRICS_FILE alignments/marked_dup_metrics_{wildcards.sample}.txt
+		samtools index alignments/{wildcards.sample}.rg.md.bam
+		"""
+
+rule create_VCF_index_snps:
+	input:
+		"data/variants/GCF.38.filtered.renamed.vcf"
+	shell:
+		"gatk IndexFeatureFile --input {input}"
+		
+rule create_VCF_index_indels:
+	input:
+		"data/variants/1000g_gold_standard.indels.filtered.vcf"
+	shell:
+		"gatk IndexFeatureFile --input {input}"
+	
+rule samtools_index_ref_genome:
+	shell:
+		"samtools faidx 'data/reference/Homo_sapiens.GRCh38.dna.chromosome.20.fa'"
+	
+rule CreateSequenceDictionary:
+	shell:
+		"gatk CreateSequenceDictionary --REFERENCE 'data/reference/Homo_sapiens.GRCh38.dna.chromosome.20.fa'"
+
+rule BaseRecalibrator:
+	input:
+		ref="data/reference/Homo_sapiens.GRCh38.dna.chromosome.20.fa",
+		reads="alignments/{sample}.rg.md.bam",
+		vcf_1="data/variants/GCF.38.filtered.renamed.vcf",
+		vcf_2="data/variants/1000g_gold_standard.indels.filtered.vcf"
+	output:
+		"results/bqsr/{sample}.recal.table"	
+	shell:
+		"""
+		gatk BaseRecalibrator \
+		--reference {input.ref} \
+		--input {input.reads}\
+		--known-sites {input.vcf_1} \
+		--known-sites {input.vcf_2} \
+		--output {output}
+		"""
+		
+rule applyBQSR:
+	input:
+		reads="alignments/{sample}.rg.md.bam",
+		recal="results/bqsr/{sample}.recal.table"
+	output:
+		"results/bqsr/{sample}.recal.bam"
+	shell:
+		"""
+		gatk ApplyBQSR \
+		--input {input.reads} \
+		--bqsr-recal-file {input.recal} \
+		--output {output}
+		"""
+		
+rule haplotypeCaller:
+	input:
+		ref="data/reference/Homo_sapiens.GRCh38.dna.chromosome.20.fa",
+		recal="results/bqsr/{sample}.recal.bam",
+	
+	output:
+		vcf="results/variants/{sample}.HC.g.vcf",
+		phasedBam="results/variants/{sample}.phased.bam"		
+		
+	shell:
+		"""
+		gatk HaplotypeCaller \
+		--reference {input.ref} \
+		--input {input.recal} \
+		--output {output.vcf} \
+		--bam-output {output.phasedBam} \
+		--intervals chr20 \
+		--ERC GVCF 
+		"""
+		
+rule VariantsToTable:
+	input:
+		"results/variants/{sample}.HC.g.vcf"
+	output:
+		"results/variants/{sample}.HC.table"
+	shell:
+		"""
+		gatk VariantsToTable \
+		--variant {input} \
+		--fields CHROM -F POS -F TYPE -GF GT \
+		--output {output}
+		"""
+
+rule createGenomicDB:
+	output:
+		directory("results/genomicsdb/")
+	shell:
+		"""
+		gatk GenomicsDBImport \
+		--variant "results/variants/father.HC.g.vcf" \
+		--variant "results/variants/mother.HC.g.vcf" \
+		--variant "results/variants/son.HC.g.vcf" \
+		--intervals chr20:10018000-10220000 \
+		--genomicsdb-workspace-path {output}
+		"""
+
+rule genotypeGVCFs:
+	input:
+		"data/reference/Homo_sapiens.GRCh38.dna.chromosome.20.fa"
+	output:
+		"results/variants/trio.vcf"
+	shell:
+		"""
+		gatk GenotypeGVCFs \
+		--reference {input}\
+		--variant gendb://results/genomicsdb \
+		--intervals chr20:10018000-10220000 \
+		--output {output} 
+		"""
+		
+rule selectSNPs:
+	input:
+		"results/variants/trio.vcf"
+	output:
+		"results/variants/trio.SNP.vcf"	
+	shell:
+		"""	
+		gatk SelectVariants \
+		--variant {input} \
+		--select-type-to-include SNP \
+		--output {output}
+		"""
+		
+rule selectINDELs:
+	input:
+		"results/variants/trio.vcf"
+	output:
+		"results/variants/trio.INDEL.vcf"	
+	shell:
+		"""	
+		gatk SelectVariants \
+		--variant {input} \
+		--select-type-to-include INDEL \
+		--output {output}
+		"""
+		
+rule hardFilter_SNPs:
+	input:
+		"results/variants/trio.SNP.vcf"
+	output:
+		"results/variants/trio.SNP.filtered.vcf"
+	shell:
+		"""
+		gatk VariantFiltration \
+		--variant {input} \
+		--filter-expression "QD < 2.0"              --filter-name "QD2" \
+		--filter-expression "QUAL < 30.0"           --filter-name "QUAL30" \
+		--filter-expression "SOR > 3.0"             --filter-name "SOR3" \
+		--filter-expression "FS > 60.0"             --filter-name "FS60" \
+		--filter-expression "MQ < 40.0"             --filter-name "MQ40" \
+		--filter-expression "MQRankSum < -12.5"     --filter-name "MQRankSum-12.5" \
+		--filter-expression "ReadPosRankSum < -8.0" --filter-name "ReadPosRankSum-8" \
+		--output {output}
+	"""
+	
+rule hardFilter_INDELs:
+	input:
+		"results/variants/trio.INDEL.vcf"
+	output:
+		"results/variants/trio.INDEL.filtered.vcf"
+	
+	shell:
+		"""
+		gatk VariantFiltration \
+		--variant {input} \
+		--filter-expression "QD < 2.0"                  --filter-name "QD2" \
+		--filter-expression "QUAL < 30.0"               --filter-name "QUAL30" \
+		--filter-expression "FS > 200.0"                --filter-name "FS200" \
+		--filter-expression "ReadPosRankSum < -20.0"    --filter-name "ReadPosRankSum-20" \
+		--output {output}
+		"""
+
+rule mergeVCFs:
+	input:
+		snp="results/variants/trio.SNP.filtered.vcf",
+		indel="results/variants/trio.INDEL.filtered.vcf"
+	output:
+		"results/variants/trio.filtered.vcf"
+	shell:
+		"""
+		gatk MergeVcfs \
+		--INPUT  {input.snp}\
+		--INPUT {input.indel} \
+		--OUTPUT {output}
+		"""
+
+rule extractVCF_per_sample:
+	input:
+		"results/variants/trio.filtered.vcf"
+	output:
+		"results/variants/{sample}.trio.filtered.vcf"
+	shell:
+		"""
+		gatk SelectVariants \
+		--variant {input} \
+		--sample-name {wildcards.sample} \
+		--exclude-non-variants \
+		--remove-unused-alternates \
+		--output {output}
+		"""
+	
+rule evaluateConcordance:
+		input:
+			data="results/variants/{sample}.trio.filtered.vcf",
+			truth="data/variants/NA12878.vcf.gz"
+		output:
+			"results/variants/concordance.{sample}.trio.filtered"
+		shell:
+			"""
+			gatk Concordance \
+			--evaluation {input.data} \
+			--truth {input.truth} \
+			--intervals chr20:10018000-10220000 \
+			--summary {output}
+			"""
+# rule vep:
+		# input:
+			# "results/variants/{sample}.trio.filtered.vcf"
+		# output:
+			# "results/vep/{sample}.trio.filtered.vcf"
+		# shell:
+			# "cd ensemble-vep"
+			# """
+			# ./vep \
+			# --input_file {input} --output_file {output} \
+			# --format vcf --vcf --symbol --terms SO --tsl\
+			# --hgvs \
+			# --offline --cache $HOME/.vep \
+			# --plugin Frameshift --plugin Wildtype \
+			# """
+
+	
+	
+	
+	
+	
+	
+	
+	
+	
+	
+	
+	
+	
+	
+	
+	
+
+
+		
+		
+		
+	
+	
+
+		
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+	
+
+	
